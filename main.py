@@ -3,6 +3,10 @@ from fastapi import Query
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import os
+from pydantic import BaseModel
+from datetime import datetime
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 app = FastAPI()
 
@@ -19,13 +23,41 @@ app.add_middleware(
 def root():
     return {"message": "Backend is live!"}
 @app.get("/scan")
-def scan(url: str = Query(...), email: str = Query(...)):
-    zapier_webhook_url = "https://hooks.zapier.com/hooks/catch/9116429/u6ozr8x/"  # Replace this
-    zapier_payload = {
-        "email": email,
-        "url": url
-    }
-    try:
-        requests.post(zapier_webhook_url, json=zapier_payload)
-    except Exception as e:
-        print("Error posting to Zapier:", e)
+class Lead(BaseModel):
+    name: str
+    email: str
+    business_name: str
+    website: str
+@app.post("/leads")
+async def capture_lead(lead: Lead):
+    store_lead_in_google_sheets(lead)
+    trigger_email_automation(lead)
+    return {"status": "success", "lead": lead}
+
+def store_lead_in_google_sheets(lead: Lead):
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict({
+        "type": "service_account",
+        "project_id": os.getenv("GOOGLE_PROJECT_ID"),
+        "private_key_id": os.getenv("GOOGLE_PRIVATE_KEY_ID"),
+        "private_key": os.getenv("GOOGLE_PRIVATE_KEY").replace('\\n', '\n'),
+        "client_email": os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL"),
+        "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+        "client_x509_cert_url": os.getenv("GOOGLE_CLIENT_X509_URL"),
+    }, scope)
+
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(os.getenv("GOOGLE_SHEET_ID")).sheet1
+    sheet.append_row([
+        datetime.utcnow().isoformat(),
+        lead.name,
+        lead.email,
+        lead.business_name,
+        lead.website
+    ])
+
+def trigger_email_automation(lead: Lead):
+    requests.post(os.getenv("N8N_WEBHOOK_URL"), json=lead.dict())
