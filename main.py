@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -10,7 +10,10 @@ import os
 
 app = FastAPI()
 
-# Allow requests from the frontend (add your real Vercel domain)
+# -------------------------
+# CORS (allow your frontend)
+# -------------------------
+# Tip: replace "https://your-frontend.vercel.app" with your real Vercel/Trickle URL when you have it.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "https://your-frontend.vercel.app"],
@@ -24,7 +27,9 @@ def root():
     return {"message": "Backend is live!"}
 
 
-# ---------- NEW: GET /scan ----------
+# =========================================================
+# 1) GET /scan  — Website performance score (PageSpeed API)
+# =========================================================
 @app.get("/scan", summary="Lead")
 def scan(
     name: str = Query(...),
@@ -61,8 +66,8 @@ def scan(
     if api_key:
         params["key"] = api_key
 
-    performance_score = None
-    psi_error = None
+    performance_score: Optional[int] = None
+    psi_error: Optional[str] = None
 
     try:
         r = requests.get(psi_endpoint, params=params, timeout=30)
@@ -73,6 +78,7 @@ def scan(
         )
     except Exception as e:
         try:
+            # If API returned a structured error
             psi_error = r.json().get("error", {}).get("message")
         except Exception:
             psi_error = str(e)
@@ -87,7 +93,9 @@ def scan(
     }
 
 
-# ---------- Existing: POST /leads ----------
+# =========================================================
+# 2) POST /leads — store in Google Sheets + trigger n8n
+# =========================================================
 class Lead(BaseModel):
     name: str
     email: str
@@ -101,7 +109,9 @@ async def capture_lead(lead: Lead):
     return {"status": "success", "lead": lead}
 
 
-# ---------- Helpers ----------
+# -----------------
+# Google Sheets I/O
+# -----------------
 def store_lead_in_google_sheets(lead: Lead):
     scope = [
         "https://spreadsheets.google.com/feeds",
@@ -143,3 +153,83 @@ def trigger_email_automation(lead: Lead):
         except requests.RequestException:
             pass
 
+
+# =========================================================
+# 3) GET /business — Google Places (Business Profile check)
+# =========================================================
+class BusinessResponse(BaseModel):
+    found: bool
+    place_id: Optional[str] = None
+    name: Optional[str] = None
+    formatted_address: Optional[str] = None
+    rating: Optional[float] = None
+    user_ratings_total: Optional[int] = None
+    website: Optional[str] = None
+    google_maps_url: Optional[str] = None
+    categories: Optional[List[str]] = None
+    open_now: Optional[bool] = None
+    error: Optional[str] = None
+
+@app.get("/business", response_model=BusinessResponse, summary="Get Google Business info")
+def get_business(
+    business_name: str = Query(..., description="Business name, e.g. 'Il Lago Trattoria'"),
+    location: str = Query(..., description="City/State/Country, e.g. 'Tiburon, CA'"),
+):
+    """
+    1) Find the place from business_name + location
+    2) Get details by place_id
+    """
+    PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
+    if not PLACES_API_KEY:
+        return BusinessResponse(found=False, error="Server missing GOOGLE_PLACES_API_KEY")
+
+    # 1) Find Place
+    find_url = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
+    find_params = {
+        "input": f"{business_name}, {location}",
+        "inputtype": "textquery",
+        "fields": "place_id,name,formatted_address",
+        "key": PLACES_API_KEY,
+    }
+    try:
+        find_res = requests.get(find_url, params=find_params, timeout=15)
+        find_json = find_res.json()
+    except Exception as e:
+        return BusinessResponse(found=False, error=f"FindPlace error: {e}")
+
+    if find_json.get("status") != "OK" or not find_json.get("candidates"):
+        return BusinessResponse(found=False, error=find_json.get("status", "Not Found"))
+
+    candidate = find_json["candidates"][0]
+    place_id = candidate["place_id"]
+
+    # 2) Place Details
+    details_url = "https://maps.googleapis.com/maps/api/place/details/json"
+    details_params = {
+        "place_id": place_id,
+        "fields": "place_id,name,formatted_address,website,url,rating,user_ratings_total,opening_hours,types",
+        "key": PLACES_API_KEY,
+    }
+    try:
+        details_res = requests.get(details_url, params=details_params, timeout=15)
+        details_json = details_res.json()
+    except Exception as e:
+        return BusinessResponse(found=False, error=f"Place Details error: {e}")
+
+    if details_json.get("status") != "OK":
+        return BusinessResponse(found=False, error=details_json.get("status", "DetailsError"))
+
+    r = details_json["result"]
+
+    return BusinessResponse(
+        found=True,
+        place_id=r.get("place_id"),
+        name=r.get("name"),
+        formatted_address=r.get("formatted_address"),
+        rating=r.get("rating"),
+        user_ratings_total=r.get("user_ratings_total"),
+        website=r.get("website"),
+        google_maps_url=r.get("url"),
+        categories=r.get("types"),
+        open_now=(r.get("opening_hours", {}) or {}).get("open_now"),
+    )
