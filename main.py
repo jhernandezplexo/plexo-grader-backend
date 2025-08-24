@@ -1,461 +1,311 @@
-from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from datetime import datetime
-import requests
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import statistics
-import math
-import os
+# ---------- GET /score ----------
+from math import log
+from typing import Dict, Any, List, Optional
 
-app = FastAPI()
+def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, x))
 
-# CORS (add your real Vercel domain when ready)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://your-frontend.vercel.app",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def _bayes_rating(rating: Optional[float], reviews: Optional[int], C: float = 4.3, m: int = 200) -> Optional[float]:
+    if rating is None or reviews is None:
+        return None
+    try:
+        n = max(0, int(reviews))
+        r = float(rating)
+        return (m * C + n * r) / (m + n)
+    except Exception:
+        return None
 
-# ---------- Root ----------
-@app.get("/")
-def root():
-    return {"message": "Backend is live!"}
+def _normalize_reviews(n: Optional[int], cap: int = 5000) -> float:
+    """
+    0..1 review strength using a log curve, saturating ~5k reviews.
+    """
+    if not isinstance(n, (int, float)) or n <= 0:
+        return 0.0
+    return _clamp(log(1 + n) / log(1 + cap))
 
-# =========================
-# Helpers (shared)
-# =========================
+def _category_match_score(gbp_types: List[str], target_category: Optional[str]) -> Optional[float]:
+    if not target_category:
+        return None
+    target = set(target_category.lower().replace(",", " ").split())
+    if not gbp_types:
+        return 0.0
+    ours = set()
+    for t in gbp_types:
+        for w in t.lower().replace("_", " ").split():
+            if w:
+                ours.add(w)
+    inter = len(target & ours)
+    union = len(target | ours) or 1
+    return _clamp(inter / union)
 
-def fetch_pagespeed_performance(website: str) -> Dict[str, Any]:
-    """Returns {'score': Optional[int], 'error': Optional[str]}"""
-    if not website.startswith("http"):
-        website = "https://" + website
+def _competition_gap_score(our_bayes: Optional[float], comp_bayes_list: List[float]) -> Optional[float]:
+    """
+    Convert (our_bayes - avg_comp_bayes) in roughly [-1.0, +1.0] star band into 0..1.
+    If you’re 1★ above average → ~1.0; 1★ below → ~0.0; equal → 0.5.
+    """
+    if our_bayes is None or not comp_bayes_list:
+        return None
+    avg_comp = sum(comp_bayes_list) / len(comp_bayes_list)
+    delta = our_bayes - avg_comp
+    return _clamp(0.5 + 0.5 * (delta / 1.0))  # scale 1 star delta to full-range swing
 
-    api_key = os.getenv("PAGESPEED_API_KEY")  # optional
-    endpoint = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+def _gbp_quality_score(gbp: Dict[str, Any]) -> float:
+    """
+    GBP quality combines:
+    - bayesian rating (0..1 after /5)
+    - review strength (log curve)
+    - presence signals (website/phone/hours) + small bonus if open_now
+    Weighted internally then clamped 0..1.
+    """
+    rating = gbp.get("rating")
+    reviews = gbp.get("user_ratings_total")
+    bayes = _bayes_rating(rating, reviews)  # ~ 1..5
+    bayes_norm = 0.0 if bayes is None else _clamp(bayes / 5.0)
+
+    review_strength = _normalize_reviews(reviews)
+
+    has_site = 1.0 if gbp.get("website") else 0.0
+    has_phone = 1.0 if gbp.get("formatted_phone_number") or gbp.get("international_phone_number") else 0.0
+    has_hours = 1.0 if gbp.get("opening_hours") or gbp.get("current_opening_hours") else 0.0
+    presence = (has_site + has_phone + has_hours) / 3.0
+
+    open_now = None
+    if isinstance(gbp.get("opening_hours"), dict) and "open_now" in gbp["opening_hours"]:
+        open_now = gbp["opening_hours"]["open_now"]
+    elif isinstance(gbp.get("current_opening_hours"), dict) and "open_now" in gbp["current_opening_hours"]:
+        open_now = gbp["current_opening_hours"]["open_now"]
+    open_bonus = 0.05 if open_now is True else 0.0
+
+    # internal weighting inside GBP quality
+    gbp_raw = 0.60 * bayes_norm + 0.25 * review_strength + 0.15 * presence
+    return _clamp(gbp_raw + open_bonus, 0.0, 1.0)
+
+def _fetch_pagespeed_score(website: str, api_key: Optional[str]) -> (Optional[int], Optional[str]):
+    psi_endpoint = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
     params = {"url": website, "category": "PERFORMANCE", "strategy": "mobile"}
     if api_key:
         params["key"] = api_key
-
     try:
-        r = requests.get(endpoint, params=params, timeout=30)
+        r = requests.get(psi_endpoint, params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
-        score = round(
-            data["lighthouseResult"]["categories"]["performance"]["score"] * 100
-        )
-        return {"score": score, "error": None}
+        perf = round(data["lighthouseResult"]["categories"]["performance"]["score"] * 100)
+        return perf, None
     except Exception as e:
         try:
-            err = r.json().get("error", {}).get("message")
+            return None, r.json().get("error", {}).get("message")
         except Exception:
-            err = str(e)
-        return {"score": None, "error": err}
+            return None, str(e)
 
-def parse_target_category(s: Optional[str]) -> Optional[str]:
-    if not s:
-        return None
-    return s.strip().lower()
-
-def string_contains_any(haystack: str, need: List[str]) -> bool:
-    h = haystack.lower()
-    return any(n in h for n in need)
-
-def gbp_type_is_restaurant(cat: str) -> bool:
-    return "restaurant" in cat
-
-def call_places_textsearch(query: str, key: str) -> Dict[str, Any]:
+def _places_text_search(business_name: str, location: str, key: str) -> Optional[str]:
     url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    return requests.get(url, params={"query": query, "key": key}, timeout=20).json()
+    params = {
+        "query": f"{business_name}, {location}",
+        "type": "restaurant",
+        "key": key,
+    }
+    r = requests.get(url, params=params, timeout=20)
+    j = r.json()
+    if j.get("status") != "OK" or not j.get("results"):
+        return None
+    return j["results"][0]["place_id"]
 
-def call_places_details(place_id: str, key: str) -> Dict[str, Any]:
+def _place_details(place_id: str, key: str) -> Dict[str, Any]:
     url = "https://maps.googleapis.com/maps/api/place/details/json"
     fields = ",".join([
         "name",
         "rating",
         "user_ratings_total",
         "formatted_address",
+        "formatted_phone_number",
+        "international_phone_number",
         "website",
         "opening_hours",
-        "types"
+        "current_opening_hours",
+        "types",
+        "url",
+        "business_status",
+        "price_level",
+        "vicinity",
+        "photos",
     ])
-    return requests.get(url, params={"place_id": place_id, "fields": fields, "key": key}, timeout=20).json()
+    params = {"place_id": place_id, "fields": fields, "key": key}
+    r = requests.get(url, params=params, timeout=20)
+    j = r.json()
+    return j.get("result", {}) if j.get("status") == "OK" else {}
 
-def call_places_nearby(lat: float, lng: float, key: str, radius_m: int = 2000) -> Dict[str, Any]:
-    url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-    return requests.get(
-        url,
-        params={
-            "location": f"{lat},{lng}",
-            "radius": radius_m,
-            "type": "restaurant",
-            "key": key,
-        },
-        timeout=20,
-    ).json()
+def _find_competitors(
+    place_id: str,
+    gbp_types: List[str],
+    lat: float,
+    lng: float,
+    key: str,
+    radius_m: int = 3000,
+    limit: int = 8,
+    filter_to_types: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Nearby search + (optional) filter by our top-level cuisine keywords present in types.
+    """
+    nearby_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+    params = {
+        "location": f"{lat},{lng}",
+        "radius": radius_m,
+        "type": "restaurant",
+        "key": key,
+    }
+    r = requests.get(nearby_url, params=params, timeout=20)
+    j = r.json()
+    results = j.get("results", [])
+    comps = []
+    # cuisine filter words pulled from our types (e.g., 'italian', 'pizza')
+    type_words = set()
+    for t in gbp_types or []:
+        for w in t.lower().replace("_", " ").split():
+            if len(w) >= 4:  # skip tiny words
+                type_words.add(w)
+    for res in results:
+        if res.get("place_id") == place_id:
+            continue
+        c_types = res.get("types", [])
+        if filter_to_types:
+            # require at least one desired type token
+            ok = any(tt in c_types for tt in filter_to_types)
+            if not ok:
+                continue
+        # or loose cuisine keyword match
+        if type_words:
+            joined = " ".join(c_types).lower().replace("_", " ")
+            if not any(w in joined for w in type_words):
+                continue
+        comps.append({
+            "place_id": res.get("place_id"),
+            "name": res.get("name"),
+            "rating": res.get("rating"),
+            "user_ratings_total": res.get("user_ratings_total"),
+            "vicinity": res.get("vicinity"),
+            "types": c_types,
+            "geometry": res.get("geometry"),
+        })
+        if len(comps) >= limit:
+            break
+    return comps
 
-def extract_lat_lng_from_textsearch(result: Dict[str, Any]) -> Optional[Dict[str, float]]:
-    try:
-        g = result["geometry"]["location"]
-        return {"lat": g["lat"], "lng": g["lng"]}
-    except Exception:
-        return None
-
-def category_matches(target: Optional[str], types: List[str]) -> bool:
-    """Loose match: if 'italian' in target -> look for 'italian' + 'restaurant'."""
-    if not target:
-        return False
-    t = target.lower()
-    # direct type hit (google types like 'restaurant', 'italian_restaurant', etc.)
-    if t.replace(" ", "_") in types:
-        return True
-    # loose contains across types text
-    joined = " ".join(types).lower()
-    return t in joined
-
-# =========================
-# Existing: /scan (PageSpeed only)
-# =========================
-@app.get("/scan", summary="Lead")
-def scan(
-    name: str = Query(...),
-    email: str = Query(...),
+@app.get("/score", summary="Score")
+def score(
     business_name: str = Query(...),
+    location: str = Query(...),
     website: str = Query(...),
+    target_category: Optional[str] = Query(None),
 ):
-    if not website.startswith("http"):
-        website = "https://" + website
+    # 1) PageSpeed
+    api_key_psi = os.getenv("PAGESPEED_API_KEY")
+    perf_score, psi_error = _fetch_pagespeed_score(website, api_key_psi)
 
-    # Optional lead forwarding
-    n8n_url = os.getenv("N8N_WEBHOOK_URL")
-    if n8n_url:
+    # 2) GBP lookups
+    places_key = os.getenv("GOOGLE_PLACES_API_KEY")
+    place_id = None
+    gbp = {}
+    comps: List[Dict[str, Any]] = []
+    if places_key:
         try:
-            requests.post(
-                n8n_url,
-                json={
-                    "name": name,
-                    "email": email,
-                    "business_name": business_name,
-                    "website": website,
-                },
-                timeout=10,
-            )
-        except requests.RequestException:
+            place_id = _places_text_search(business_name, location, places_key)
+            if place_id:
+                gbp = _place_details(place_id, places_key) or {}
+                # coords for competitor search
+                lat = gbp.get("geometry", {}).get("location", {}).get("lat")
+                lng = gbp.get("geometry", {}).get("location", {}).get("lng")
+                if lat is not None and lng is not None:
+                    comps = _find_competitors(
+                        place_id,
+                        gbp.get("types", []) or [],
+                        float(lat),
+                        float(lng),
+                        places_key,
+                        radius_m=3000,
+                        limit=8,
+                    )
+        except Exception:
             pass
 
-    psi = fetch_pagespeed_performance(website)
+    # 3) Component raw scores 0..1 (some can be None)
+    perf_raw = None if perf_score is None else _clamp(perf_score / 100.0)
+    gbp_raw = _gbp_quality_score(gbp) if gbp else None
+    cat_raw = _category_match_score(gbp.get("types", []) if gbp else [], target_category)
 
-    return {
-        "name": name,
-        "email": email,
-        "business_name": business_name,
-        "website": website,
-        "performance_score": psi["score"],
-        "psi_error": psi["error"],
+    our_bayes = _bayes_rating(gbp.get("rating"), gbp.get("user_ratings_total")) if gbp else None
+    comp_bayes_list = []
+    for c in comps:
+        comp_b = _bayes_rating(c.get("rating"), c.get("user_ratings_total"))
+        if comp_b is not None:
+            c["bayes"] = comp_b
+            comp_bayes_list.append(comp_b)
+    comp_raw = _competition_gap_score(our_bayes, comp_bayes_list) if comp_bayes_list else None
+
+    # 4) Weights (your “Local SEO heavier” setting)
+    weights = {
+        "performance": 0.30,
+        "gbp_quality": 0.45,
+        "category_match": 0.10,
+        "competition_gap": 0.15,
     }
 
-# =========================
-# Existing: /business (GBP + competitors, with category filter)
-# =========================
-@app.get("/business")
-def business(
-    business_name: str = Query(..., description="Business name, e.g. 'Il Lago Trattoria'"),
-    location: str = Query(..., description="City/State/Country, e.g. 'Doral, FL'"),
-    target_category: Optional[str] = Query(None, description="e.g. 'Italian restaurant'"),
-):
-    api_key = os.getenv("GOOGLE_PLACES_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="Missing GOOGLE_PLACES_API_KEY")
-
-    tcat = parse_target_category(target_category)
-
-    # 1) Find the place
-    search = call_places_textsearch(f"{business_name} {location}", api_key)
-    if search.get("status") != "OK" or not search.get("results"):
-        return {
-            "found": False,
-            "place_id": None,
-            "name": None,
-            "formatted_address": None,
-            "rating": None,
-            "user_ratings_total": None,
-            "website": None,
-            "google_maps_url": None,
-            "categories": None,
-            "open_now": None,
-            "competitors": [],
-            "error": search.get("status"),
-        }
-
-    primary = search["results"][0]
-    place_id = primary["place_id"]
-
-    # 2) Details
-    details = call_places_details(place_id, api_key)
-    if details.get("status") != "OK":
-        return {
-            "found": False,
-            "place_id": place_id,
-            "name": None,
-            "formatted_address": None,
-            "rating": None,
-            "user_ratings_total": None,
-            "website": None,
-            "google_maps_url": f"https://maps.google.com/?cid={primary.get('place_id','')}",
-            "categories": None,
-            "open_now": None,
-            "competitors": [],
-            "error": details.get("status"),
-        }
-
-    result = details["result"]
-    name = result.get("name")
-    rating = result.get("rating")
-    reviews = result.get("user_ratings_total")
-    formatted_address = result.get("formatted_address")
-    website = result.get("website")
-    open_now = None
-    if result.get("opening_hours") and "open_now" in result["opening_hours"]:
-        open_now = result["opening_hours"]["open_now"]
-    types = result.get("types", [])
-    gmaps_url = f"https://maps.google.com/?cid={place_id}"
-
-    # 3) Competitors (nearby restaurants)
-    coords = extract_lat_lng_from_textsearch(primary)
-    comp_list: List[Dict[str, Any]] = []
-    if coords:
-        nearby = call_places_nearby(coords["lat"], coords["lng"], api_key, radius_m=2000)
-        for p in nearby.get("results", []):
-            # Filter to restaurants only
-            types_p = p.get("types", [])
-            if not any(gbp_type_is_restaurant(t) for t in types_p):
-                continue
-
-            # Optional: filter to same cuisine / target category
-            if tcat and not category_matches(tcat, types_p):
-                continue
-
-            comp_list.append({
-                "place_id": p.get("place_id"),
-                "name": p.get("name"),
-                "rating": p.get("rating"),
-                "user_ratings_total": p.get("user_ratings_total"),
-                "vicinity": p.get("vicinity"),
-            })
-
-        # keep the strongest 5 by review count
-        comp_list = sorted(
-            [c for c in comp_list if c.get("rating") is not None],
-            key=lambda x: (x.get("user_ratings_total") or 0),
-            reverse=True
-        )[:5]
-
-    return {
-        "found": True,
-        "place_id": place_id,
-        "name": name,
-        "formatted_address": formatted_address,
-        "rating": rating,
-        "user_ratings_total": reviews,
-        "website": website,
-        "google_maps_url": gmaps_url,
-        "categories": types,
-        "open_now": open_now,
-        "competitors": comp_list,
-        "error": None,
-    }
-
-# =========================
-# NEW: /score  (overall 0–100 with breakdown)
-# =========================
-@app.get("/score")
-def score(
-    business_name: str = Query(..., description="e.g. 'Il Lago Trattoria'"),
-    location: str = Query(..., description="e.g. 'Doral, FL'"),
-    website: str = Query(..., description="e.g. 'https://example.com'"),
-    target_category: Optional[str] = Query(None, description="e.g. 'Italian restaurant'"),
-):
-    """
-    Returns an overall score (0–100) and a per-component breakdown.
-    Components (default weights):
-      - performance (PageSpeed): 40%
-      - gbp quality (rating, reviews, presence, open_now): 35%
-      - category match (if target_category provided): 10%
-      - competition gap (your rating vs competitors avg): 15%
-    If any component is missing, weights auto-rescale to the signals we have.
-    """
-    warnings: List[str] = []
-
-    # 1) PageSpeed
-    psi = fetch_pagespeed_performance(website)
-    perf_raw = None  # 0..1
-    if psi["score"] is not None:
-        perf_raw = max(0.0, min(1.0, psi["score"] / 100.0))
-    else:
-        warnings.append(f"PageSpeed error: {psi['error']}")
-
-    # 2) GBP + competitors
-    biz = business(business_name=business_name, location=location, target_category=target_category)
-    if not biz.get("found"):
-        warnings.append(f"Business not found or Places error: {biz.get('error')}")
-    rating = biz.get("rating")
-    reviews = biz.get("user_ratings_total")
-    open_now = biz.get("open_now")
-    types = biz.get("categories") or []
-    comps: List[Dict[str, Any]] = biz.get("competitors") or []
-
-    # 2a) GBP quality raw 0..1
-    gbp_raw = None
-    if rating is not None:
-        rating_part = max(0.0, min(1.0, float(rating) / 5.0))
-        # reviews: log-scale, cap at ~10k reviews
-        # log10(10000)=4 → /4 ≈ 1.0 cap
-        rev_part = 0.0
-        if reviews is not None:
-            rev_part = max(0.0, min(1.0, math.log10(max(1, int(reviews))) / 4.0))
-        presence_part = 1.0  # we found it, so +presence
-        open_part = 0.0
-        if open_now is True:
-            open_part = 0.2  # small bonus
-        # Weighted inside gbp: rating 0.6, reviews 0.2, presence 0.15, open_now 0.05
-        gbp_raw = max(0.0, min(1.0, (0.6 * rating_part) + (0.2 * rev_part) + (0.15 * presence_part) + (0.05 * open_part)))
-    else:
-        warnings.append("GBP rating unavailable; GBP component skipped.")
-
-    # 2b) Category match raw 0..1 (only if target_category provided)
-    cat_raw = None
-    tcat = parse_target_category(target_category)
-    if tcat:
-        cat_raw = 1.0 if category_matches(tcat, types) else 0.0
-        if cat_raw == 0.0:
-            warnings.append(f"Target category '{tcat}' not detected in GBP types.")
-
-    # 2c) Competition gap raw 0..1
-    comp_raw = None
-    if rating is not None and comps:
-        comp_ratings = [c.get("rating") for c in comps if c.get("rating") is not None]
-        if comp_ratings:
-            comp_avg = statistics.mean(comp_ratings)
-            diff = float(rating) - float(comp_avg)  # positive is good
-            # map diff in [-0.5, +0.5] to [0..1] (clip outside)
-            # 0.5 above avg => 1.0; 0.5 below => 0.0
-            comp_raw = max(0.0, min(1.0, (diff + 0.5) / 1.0))
-        else:
-            warnings.append("No competitor ratings available; competition component skipped.")
-    elif rating is None:
-        warnings.append("Missing your GBP rating; competition component skipped.")
-    else:
-        warnings.append("No competitors found; competition component skipped.")
-
-    # 3) Aggregate with adaptive weights
-    # base weights
-    W_PERF = 0.40
-    W_GBP = 0.35
-    W_CAT = 0.10
-    W_COMP = 0.15
-
-    parts = [
-        {"key": "performance", "weight": W_PERF, "raw": perf_raw, "explain": "PageSpeed (mobile PERFORMANCE category)"},
-        {"key": "gbp_quality", "weight": W_GBP, "raw": gbp_raw, "explain": "GBP rating/reviews/presence/open_now"},
-        {"key": "category_match", "weight": W_CAT, "raw": cat_raw, "explain": "GBP types vs. provided target_category"},
-        {"key": "competition_gap", "weight": W_COMP, "raw": comp_raw, "explain": "Your rating vs. nearby competitors’ avg"},
+    # 5) Auto‑rescale if any pieces missing
+    components = [
+        ("performance", perf_raw,      "PageSpeed (mobile PERFORMANCE category)"),
+        ("gbp_quality", gbp_raw,       "GBP rating/reviews/presence/open_now"),
+        ("category_match", cat_raw,    "GBP types vs. provided target_category"),
+        ("competition_gap", comp_raw,  "Your rating vs. nearby competitors’ avg (Bayesian)"),
     ]
+    available_w = sum(weights[k] for k, raw, _ in components if raw is not None) or 1.0
+    scale = 1.0 / available_w
+    total_points = 0.0
+    comp_rows = []
+    for key, raw, explain in components:
+        w = weights[key]
+        if raw is None:
+            comp_rows.append({
+                "key": key,
+                "weight": w,
+                "raw": None,
+                "explain": explain,
+                "points": None,
+            })
+            continue
+        pts = 100.0 * (w * scale) * raw
+        total_points += pts
+        comp_rows.append({
+            "key": key,
+            "weight": w,
+            "raw": round(raw, 4),
+            "explain": explain,
+            "points": round(pts, 1),
+        })
 
-    available_weight = sum(p["weight"] for p in parts if p["raw"] is not None)
-    if available_weight == 0:
-        raise HTTPException(status_code=502, detail="No usable signals to compute a score.")
-
-    # normalized 0..100
-    total = sum((p["raw"] or 0.0) * p["weight"] for p in parts) / available_weight * 100.0
-    total_rounded = round(total)
-
-    # add points (each component’s contribution in 0..100 terms)
-    for p in parts:
-        if p["raw"] is None:
-            p["points"] = None
-        else:
-            p["points"] = round((p["raw"] * p["weight"] / available_weight) * 100.0, 1)
+    # 6) Assemble competitor summary (small + ready to show)
+    comp_summary = [{
+        "name": c.get("name"),
+        "rating": c.get("rating"),
+        "reviews": c.get("user_ratings_total"),
+        "bayes": round(c.get("bayes", 0.0), 3) if isinstance(c.get("bayes"), (int, float)) else None,
+        "vicinity": c.get("vicinity"),
+        "types": c.get("types"),
+    } for c in comps]
 
     return {
         "input": {
             "business_name": business_name,
             "location": location,
             "website": website,
-            "target_category": tcat,
+            "target_category": target_category,
         },
-        "pagespeed": {"performance_score": psi["score"], "error": psi["error"]},
-        "gbp": {
-            "found": biz.get("found"),
-            "name": biz.get("name"),
-            "rating": rating,
-            "user_ratings_total": reviews,
-            "open_now": open_now,
-            "categories": types,
-            "competitors_count": len(comps),
+        "pagespeed": {
+            "performance_score": perf_score,
+            "error": psi_error,
         },
-        "components": parts,
-        "score": total_rounded,
-        "warnings": warnings or None,
+        "gbp": gbp or None,              # raw GBP object (expand in UI)
+        "competitors": comp_summary,     # compact list for UI details
+        "components": comp_rows,         # 4-row table (weight/raw/points/explain)
+        "score": round(total_points),    # 0..100 number grade
+        "warnings": None,
     }
-
-# =========================
-# Existing: POST /leads (unchanged)
-# =========================
-class Lead(BaseModel):
-    name: str
-    email: str
-    business_name: str
-    website: str
-
-@app.post("/leads")
-async def capture_lead(lead: Lead):
-    store_lead_in_google_sheets(lead)
-    trigger_email_automation(lead)
-    return {"status": "success", "lead": lead}
-
-def store_lead_in_google_sheets(lead: Lead):
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(
-        {
-            "type": "service_account",
-            "project_id": os.getenv("GOOGLE_PROJECT_ID"),
-            "private_key_id": os.getenv("GOOGLE_PRIVATE_KEY_ID"),
-            "private_key": os.getenv("GOOGLE_PRIVATE_KEY").replace("\\n", "\n"),
-            "client_email": os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL"),
-            "client_id": os.getenv("GOOGLE_CLIENT_ID"),
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-            "client_x509_cert_url": os.getenv("GOOGLE_CLIENT_X509_URL"),
-        },
-        scope,
-    )
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(os.getenv("GOOGLE_SHEET_ID")).sheet1
-    sheet.append_row(
-        [
-            datetime.utcnow().isoformat(),
-            lead.name,
-            lead.email,
-            lead.business_name,
-            lead.website,
-        ]
-    )
-
-def trigger_email_automation(lead: Lead):
-    n8n_url = os.getenv("N8N_WEBHOOK_URL")
-    if n8n_url:
-        try:
-            requests.post(n8n_url, json=lead.dict(), timeout=10)
-        except requests.RequestException:
-            pass
