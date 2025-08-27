@@ -1,13 +1,12 @@
-# Core web stack
 fastapi==0.110.0
 uvicorn[standard]==0.29.0
 
-# HTTP client (you previously hit a "httpx not found" error)
+# HTTP client for Google APIs, PSI, etc.
 httpx==0.27.0
 
 # Pydantic v2 (FastAPI depends on it)
 pydantic==2.7.1
 pydantic-core==2.18.2
 
-# Optional: load local env vars if needed (safe to keep pinned)
+# Optional: load local env vars if you need them
 python-dotenv==1.0.1
