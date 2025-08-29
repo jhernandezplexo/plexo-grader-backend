@@ -1,5 +1,5 @@
 # main.py
-# Plexo Grader Backend (FastAPI)
+# Plexo Grader Backend (FastAPI) — forgiving search version
 
 import os
 import math
@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="Plexo Grader Backend", version="0.3.1")
+app = FastAPI(title="Plexo Grader Backend", version="0.3.2")
 
 # -----------------------------
 # Environment
@@ -26,6 +26,8 @@ PAGESPEED_API_KEY: str = os.getenv("PAGESPEED_API_KEY", "").strip()
 PLACES_TEXT_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
 PLACES_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
 PLACES_NEARBY_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+PLACES_FINDPLACE_URL = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
+GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 
 # Reasonable default radius for "nearby competitors" (meters)
 DEFAULT_RADIUS_M = 3000
@@ -198,21 +200,80 @@ def _clean_competitor_types(types: Optional[List[str]]) -> List[str]:
 
 
 def _details_maps_url(place_id: str) -> str:
+    # this CID-style URL pattern may not always resolve; you also get a proper 'url' from Place Details
     return f"https://maps.google.com/?cid={place_id}"
 
 
 # -----------------------------
 # Google Places (async httpx)
 # -----------------------------
+async def _http_get(client: httpx.AsyncClient, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    p = {k: v for k, v in params.items() if v not in (None, "", [], {}, 0)}
+    p["key"] = GOOGLE_API_KEY
+    r = await client.get(url, params=p, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+async def geocode_location(client: httpx.AsyncClient, location_str: str) -> Tuple[Optional[float], Optional[float]]:
+    data = await _http_get(client, GEOCODE_URL, {"address": location_str})
+    if data.get("status") == "OK" and data.get("results"):
+        loc = data["results"][0]["geometry"]["location"]
+        return loc.get("lat"), loc.get("lng")
+    return None, None
+
+
+async def find_place_textquery(
+    client: httpx.AsyncClient,
+    query: str,
+    lat: Optional[float],
+    lng: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    params = {
+        "input": query,
+        "inputtype": "textquery",
+        "fields": "place_id,name,formatted_address,types",
+    }
+    if lat is not None and lng is not None:
+        params["locationbias"] = f"point:{lat},{lng}"
+    data = await _http_get(client, PLACES_FINDPLACE_URL, params)
+    if data.get("status") == "OK":
+        cands = data.get("candidates") or []
+        return cands[0] if cands else None
+    return None
+
+
+async def text_search_with_bias(
+    client: httpx.AsyncClient,
+    query: str,
+    lat: Optional[float],
+    lng: Optional[float],
+    radius_m: int,
+    target_category: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    params = {
+        "query": query,
+    }
+    if lat is not None and lng is not None:
+        params["location"] = f"{lat},{lng}"
+        params["radius"] = radius_m
+        params["type"] = "restaurant"
+    if target_category:
+        params["keyword"] = _norm_category(target_category)
+
+    data = await _http_get(client, PLACES_TEXT_URL, params)
+    results = data.get("results") or []
+    return results[0] if results else None
+
+
 async def places_text_search(
     client: httpx.AsyncClient, query: str
 ) -> Optional[Dict[str, Any]]:
+    # kept for compatibility (unbiased text search)
     if not _ok(GOOGLE_API_KEY):
         return None
-
-    params = {"query": query, "key": GOOGLE_API_KEY}
-    r = await client.get(PLACES_TEXT_URL, params=params, timeout=30)
-    data = r.json()
+    params = {"query": query}
+    data = await _http_get(client, PLACES_TEXT_URL, params)
     results = data.get("results") or []
     return results[0] if results else None
 
@@ -228,9 +289,8 @@ async def place_details(
         "opening_hours,opening_hours/open_now,website,url,"
         "geometry/location,geometry,utc_offset_minutes"
     )
-    params = {"place_id": place_id, "fields": fields, "key": GOOGLE_API_KEY}
-    r = await client.get(PLACES_DETAILS_URL, params=params, timeout=30)
-    data = r.json()
+    params = {"place_id": place_id, "fields": fields}
+    data = await _http_get(client, PLACES_DETAILS_URL, params)
     return (data or {}).get("result")
 
 
@@ -254,13 +314,11 @@ async def nearby_restaurants(
             "location": f"{lat},{lng}",
             "radius": radius_m,
             "type": "restaurant",
-            "key": GOOGLE_API_KEY,
         }
         if token:
             params["pagetoken"] = token
 
-        r = await client.get(PLACES_NEARBY_URL, params=params, timeout=30)
-        data = r.json()
+        data = await _http_get(client, PLACES_NEARBY_URL, params)
         results = data.get("results") or []
         all_results.extend(results)
 
@@ -301,11 +359,26 @@ async def business(
             detail="GOOGLE_API_KEY is not set in the environment.",
         )
 
-    query = f"{business_name} {location}"
     out = BusinessOut(found=False, competitors=[])
+    query = f"{business_name} {location}".strip()
 
     async with httpx.AsyncClient() as client:
-        main_candidate = await places_text_search(client, query)
+        # 1) Geocode location to bias searches
+        lat, lng = await geocode_location(client, location)
+
+        # 2) Try Find Place with location bias
+        main_candidate = await find_place_textquery(client, query, lat, lng)
+
+        # 3) If not found, try Text Search within radius (more forgiving)
+        if not main_candidate:
+            main_candidate = await text_search_with_bias(
+                client, query, lat, lng, radius_m, target_category
+            )
+
+        # 4) As a last resort, try the original unbiased Text Search
+        if not main_candidate:
+            main_candidate = await places_text_search(client, query)
+
         if not main_candidate:
             out.error = "No business found"
             return out
